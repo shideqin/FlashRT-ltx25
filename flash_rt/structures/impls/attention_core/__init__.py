@@ -40,7 +40,11 @@ def bind_dense_attention_best(captures, *, prefer=()):
     # (ValueError from the loader's metadata check), the kernels
     # library finding no build variant for the host (OSError), or a
     # bind smoke the runtime cannot execute (RuntimeError) — each
-    # means "not this variant here", never an error for the family
+    # means "not this variant here", never an error for the family.
+    # ImportError/AttributeError cover a fourth, packaging-side case:
+    # an artifact whose wrapper cannot import against the installed
+    # DSL version. Same verdict — this variant is not on this host —
+    # and the next rung gets weighed.
     def _fa2(caps):
         return bind_dense_attention(caps)
 
@@ -78,7 +82,8 @@ def bind_dense_attention_best(captures, *, prefer=()):
     for name, binder in order:
         try:
             core = binder(captures)
-        except (ValueError, RuntimeError, OSError) as refusal:
+        except (ValueError, RuntimeError, OSError, ImportError,
+                AttributeError) as refusal:
             refusals.append(f"{name}: {str(refusal)[:120]}")
             continue
         if core is not None and not _beats_host(core, captures[0]):
