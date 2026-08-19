@@ -1894,6 +1894,38 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     ENABLE_QWEN3_FP8_PREFILL_ATTN=1)
 endif()
 
+# LTX-2.5 runtime sage2 raw-pointer kernels (the ``sage2-fvk`` attention
+# swap). The motus_aux object that normally carries sage2_attn_raw.cu is
+# gated on FLASHRT_ENABLE_MOTUS, so this one TU gets its own object rather
+# than pulling the Motus megakernels into a build that does not ask for
+# them. Guarded against MOTUS to avoid duplicate symbols when both are on.
+if((GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121") AND
+   NOT FLASHRT_ENABLE_MOTUS)
+  add_library(ltx25_sage2_raw_obj OBJECT
+    csrc/attention/sage2/sage2_attn_raw.cu)
+  set_target_properties(ltx25_sage2_raw_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(ltx25_sage2_raw_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/sage2
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/sage2/qattn
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantize
+  )
+  target_compile_options(ltx25_sage2_raw_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:ltx25_sage2_raw_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_MOTUS_SAGE2_RAW=1)
+endif()
+
 # SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_sources(flash_rt_kernels PRIVATE
