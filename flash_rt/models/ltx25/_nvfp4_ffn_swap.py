@@ -74,6 +74,41 @@ def _swizzled_sf_bytes(rows: int, cols: int) -> int:
 def _stream() -> int:
     return torch.cuda.current_stream().cuda_stream
 
+def _capturing() -> bool:
+    # Persistent output buffers are required while a CUDA graph is being
+    # recorded (addresses must stay fixed). Outside capture they alias
+    # across back-to-back FFN/attention calls and must be cloned.
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _warmup_ffn_chain(model: torch.nn.Module) -> None:
+    """Prime CUTLASS static state before the first real denoise step.
+
+    ``fp4_w4a16_gemm_bias_gelu_fp4out_sm120`` copies a 1.0f epilogue
+    ``norm_constant`` with default-stream ``cudaMemcpy`` on first call.
+    The GEMM then launches on the torch stream. Under a busy combo
+    (sage2 + FFN) that copy often lands *after* the first GEMM reads
+    the constant, which yields Inf/NaN scales and a black video. One
+    dummy aligned call plus a device sync closes the race for the
+    rest of the process.
+    """
+    for module in model.modules():
+        fwd = module.__dict__.get("forward")
+        if fwd is None or not hasattr(fwd, "_flash_rt_keep"):
+            continue
+        dim = int(module.net[0].proj.in_features)
+        keep = fwd._flash_rt_keep
+        dummy = torch.zeros(128, dim, dtype=torch.bfloat16, device=keep[0].device)
+        with torch.no_grad():
+            _ = fwd(dummy)
+        torch.cuda.synchronize()
+        logger.info("[ltx25] warmed fvk FFN chain (M=128, dim=%d)", dim)
+        return
+
+
 
 def _quantize_bf16_to_swz(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     rows, cols = x.shape
@@ -115,13 +150,13 @@ class _FfnBuffers:
         key = (device, m, dim, inner)
         bufs = self._cache.get(key)
         if bufs is None:
-            xq = torch.empty(m, dim // 2, dtype=torch.uint8, device=device)
+            xq = torch.zeros(m, dim // 2, dtype=torch.uint8, device=device)
             xsf = torch.zeros(_swizzled_sf_bytes(m, dim), dtype=torch.uint8,
                               device=device)
-            h4 = torch.empty(m, inner // 2, dtype=torch.uint8, device=device)
+            h4 = torch.zeros(m, inner // 2, dtype=torch.uint8, device=device)
             h4sf = torch.zeros(_swizzled_sf_bytes(m, inner), dtype=torch.uint8,
                                device=device)
-            y = torch.empty(m, dim, dtype=torch.bfloat16, device=device)
+            y = torch.zeros(m, dim, dtype=torch.bfloat16, device=device)
             bufs = (xq, xsf, h4, h4sf, y)
             self._cache[key] = bufs
         return bufs
@@ -175,18 +210,24 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers,
         x2 = x.reshape(-1, shape[-1])
         m = x2.shape[0]
         if not rows_are_swappable(m):
-            # The chain rejects unaligned M (can_implement status 11)
-            # without writing the output; e.g. the ~126-token audio branch.
-            # Those calls are negligible work -- keep them on upstream.
-            if freed:
-                raise RuntimeError(
-                    f"ltx25 FFN: M={m} is not 128-aligned but the upstream "
-                    "weights were freed (resident mode). Use dimensions whose "
-                    "token counts are 128-aligned, or disable capture mode.")
-            return upstream_forward(x)
+            if not freed:
+                # The chain rejects unaligned M (can_implement status 11)
+                # without writing the output; e.g. the ~126-token audio
+                # branch. Those calls are negligible work -- keep them on
+                # upstream when its weights are still around.
+                return upstream_forward(x)
+            # Resident mode freed the upstream weights, so an unaligned-M
+            # call cannot fall back. The chain is row-independent (GEMM,
+            # GELU and bias all act per output row), so running it at the
+            # next 128-aligned row count is exact on the real rows: quantize
+            # the m real rows, run the chain on m_run rows (the padding rows
+            # read zero-initialized buffers), and slice the output back.
+            m_run = ((m + 127) // 128) * 128
+        else:
+            m_run = m
         x2 = x2 if x2.is_contiguous() else x2.contiguous()
         stream = _stream()
-        xq, xsf, h4, h4sf, y = buffers.get(x2.device, m, dim, inner)
+        xq, xsf, h4, h4sf, y = buffers.get(x2.device, m_run, dim, inner)
         fvk.quantize_bf16_to_nvfp4_swizzled(
             int(x2.data_ptr()), int(xq.data_ptr()), int(xsf.data_ptr()),
             m, dim, stream)
@@ -194,15 +235,16 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers,
             int(xq.data_ptr()), int(up_p.data_ptr()),
             int(xsf.data_ptr()), int(up_sf.data_ptr()),
             int(up_bias.data_ptr()), int(h4.data_ptr()), int(h4sf.data_ptr()),
-            m, inner, dim, 1.0, stream)
+            m_run, inner, dim, 1.0, stream)
         fvk.fp4_w4a16_gemm_sm120_bf16out(
             int(h4.data_ptr()), int(dn_p.data_ptr()), int(y.data_ptr()),
-            m, dim, inner,
+            m_run, dim, inner,
             int(h4sf.data_ptr()), int(dn_sf.data_ptr()), 1.0, stream)
         if dn_bias is not None:
             fvk.add_bias_bf16(
-                int(y.data_ptr()), int(dn_bias.data_ptr()), m, dim, stream)
-        return y.view(*shape[:-1], dim)
+                int(y.data_ptr()), int(dn_bias.data_ptr()), m_run, dim, stream)
+        out = y[:m].view(*shape[:-1], dim)
+        return out if _capturing() else out.clone()
 
     # Raw-pointer launches are opaque to dynamo; keep them eager under
     # torch.compile (CUDA graph capture still records the kernels).
@@ -239,6 +281,8 @@ def install_nvfp4_ffn(model: torch.nn.Module, *,
         count += 1
     logger.info("[ltx25] swapped %d FeedForward modules to fvk W4A4 chain",
                 count)
+    if count:
+        _warmup_ffn_chain(model)
     return count
 
 
