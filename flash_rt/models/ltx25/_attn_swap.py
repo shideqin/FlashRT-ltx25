@@ -92,21 +92,34 @@ class FvkSage2Attention:
         key = (device, b, lq, lk, h)
         bufs = self._bufs.get(key)
         if bufs is None:
+            # The sage2 kernel reads/writes Q in CTA_Q=128-row tiles and reads
+            # the per-warp q-scales with per-head stride gridDim.x*num_warps_q
+            # = ceil(pad_lq/128)*4. When lq is not a 128 multiple that stride
+            # over-runs the ceil(lq/32) scales the quantizer writes (a layout
+            # mismatch that silently shifts every head's scales and can read
+            # NaN past the tail). Padding Q to a 128 multiple keeps the two
+            # strides equal; the padding rows are masked out by the kernel's
+            # qo_len predicate.
+            pad_lq = ((lq + 127) // 128) * 128
             pad_lk = ((lk + 63) // 64) * 64
-            q8 = torch.empty(b, lq, h, 128, dtype=torch.int8, device=device)
-            k8 = torch.empty(b, lk, h, 128, dtype=torch.int8, device=device)
-            vt = torch.empty(b, 128, h, pad_lk, dtype=torch.bfloat16,
+            qp = torch.zeros(b, pad_lq, h, 128, dtype=torch.bfloat16,
                              device=device)
-            v8 = torch.empty(b, 128, h, pad_lk, dtype=torch.float8_e4m3fn,
+            q8 = torch.zeros(b, pad_lq, h, 128, dtype=torch.int8,
                              device=device)
-            qs = torch.empty(b, h, (lq + 31) // 32, dtype=torch.float32,
+            k8 = torch.zeros(b, pad_lk, h, 128, dtype=torch.int8,
                              device=device)
-            ks = torch.empty(b, h, (lk + 63) // 64, dtype=torch.float32,
+            vt = torch.zeros(b, 128, h, pad_lk, dtype=torch.bfloat16,
                              device=device)
-            vs = torch.empty(b, h, 128, dtype=torch.float32, device=device)
-            out = torch.empty(b, lq, h, 128, dtype=torch.bfloat16,
+            v8 = torch.zeros(b, 128, h, pad_lk, dtype=torch.float8_e4m3fn,
+                             device=device)
+            qs = torch.zeros(b, h, (pad_lq + 31) // 32, dtype=torch.float32,
+                             device=device)
+            ks = torch.zeros(b, h, (lk + 63) // 64, dtype=torch.float32,
+                             device=device)
+            vs = torch.zeros(b, h, 128, dtype=torch.float32, device=device)
+            out = torch.zeros(b, pad_lq, h, 128, dtype=torch.bfloat16,
                               device=device)
-            bufs = (q8, k8, vt, v8, qs, ks, vs, out)
+            bufs = (qp, q8, k8, vt, v8, qs, ks, vs, out)
             self._bufs[key] = bufs
         return bufs
 
@@ -126,13 +139,23 @@ class FvkSage2Attention:
         kn = kn if kn.is_contiguous() else kn.contiguous()
         vn = vn if vn.is_contiguous() else vn.contiguous()
 
-        q8, k8, vt, v8, qs, ks, vs, out = self._buffers(
+        qp, q8, k8, vt, v8, qs, ks, vs, out = self._buffers(
             q.device, b, lq, lk, heads)
         stream = self._stream_fn()
 
+        # When lq is not a 128 multiple, run the quantize + attention on a
+        # padded row count so the q-scale layout (per-head stride) matches the
+        # attention kernel's; the copy-in is the only extra launch.
+        pad_lq = ((lq + 127) // 128) * 128
+        if pad_lq != lq:
+            qp[:, :lq].copy_(qn)
+            qn_run, lq_run = qp, pad_lq
+        else:
+            qn_run, lq_run = qn, lq
+
         fvk.quant_per_warp_int8_bf16_d128(
-            int(qn.data_ptr()), int(q8.data_ptr()), int(qs.data_ptr()),
-            b, lq, heads, stream)
+            int(qn_run.data_ptr()), int(q8.data_ptr()), int(qs.data_ptr()),
+            b, lq_run, heads, stream)
         fvk.quant_per_block_int8_bf16_d128(
             int(kn.data_ptr()), int(k8.data_ptr()), int(ks.data_ptr()),
             b, lk, heads, stream)
@@ -149,11 +172,16 @@ class FvkSage2Attention:
         rc = fvk.sage2_qk_int8_sv_f8_bf16_nhd_d128(
             int(q8.data_ptr()), int(k8.data_ptr()), int(v8.data_ptr()),
             int(out.data_ptr()), int(qs.data_ptr()), int(ks.data_ptr()),
-            int(vs.data_ptr()), b, lq, lk, heads,
+            int(vs.data_ptr()), b, lq_run, lk, heads,
             float(d ** -0.5), stream)
         if rc != 0:
             raise RuntimeError(f"[ltx25.sage2] raw attention rc={rc}")
-        return out.view(b, lq, hd)
+        viewed = out[:, :lq].view(b, lq, hd)
+        try:
+            capturing = bool(torch.cuda.is_current_stream_capturing())
+        except Exception:
+            capturing = False
+        return viewed if capturing else viewed.clone()
 
 
 class SagePkgAttention:
