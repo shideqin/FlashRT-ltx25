@@ -64,6 +64,15 @@ uv sync --package ltx-core --extra natten
 （构建步骤用 `python3 -m pybind11 --cmakedir` 定位 pybind11 头文件）。**无需
 `pip install flash-attn`**——FA2 以源码形式 vendored，随构建打进 `flash_rt_fa2.so`。
 
+先装与你 CUDA 匹配的 PyTorch wheel（参考环境为 `torch 2.12.1+cu130`；FlashRT 对 torch
+版本保持中立，稳定索引命令见 `USAGE.md`）：
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu128   # 示例：CUDA 12.8
+```
+
+然后：
+
 ```bash
 cd FlashRT
 git clone --depth 1 --branch v4.4.2 \
@@ -117,6 +126,9 @@ export FLASH_RT_LTX2_ROOT=/path/to/LTX-2   # 指向 LTX-2 monorepo（默认 /wor
 export HF_HOME=/path/to/hf_cache            # FlashRT kernel wheel 缓存（flashrt/kernels-*）
 export HF_ENDPOINT=https://hf-mirror.com    # 需要镜像时
 ```
+
+`hf_cache` 可整目录从旧机复制（最快）；若没有，留空即可，FlashRT 首次运行会从
+HuggingFace 自动下载 `flashrt/kernels-*` wheel。
 
 ### 2.7 冒烟验证
 
